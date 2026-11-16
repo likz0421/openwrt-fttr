@@ -142,7 +142,7 @@ struct fmcs_priv {
 	u16 omci_channel[16];
 	struct net_device *ploam_dev;
 	struct net_device *fttr_devs[FMCS_MAX_FTTR_PORTS];
-	unsigned int fttr_port_count; /* immutable after netdev initialization */
+	u8 fttr_port_count; /* immutable after netdev initialization, validated 0..16 */
 	/* Published after all lower/upper links exist; protected by RTNL/RCU. */
 	struct net_device __rcu *fttr_lower;
 	struct notifier_block fttr_netdev_nb;

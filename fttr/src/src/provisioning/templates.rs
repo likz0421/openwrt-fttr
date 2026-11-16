@@ -47,6 +47,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Share its validation so config check and optical startup accept the same input.
     crate::optical::parse_export(text).map_err(|error| error.to_string())?;
     crate::optical::parse_calibration_mode(text).map_err(|error| error.to_string())?;
+    crate::ports::parse(text)?;
     let all = config::parse_sections(text)?;
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
@@ -66,6 +67,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 | "network"
                 | "wifi"
                 | "offload"
+                | "ports"
                 | "mqtt"
                 | "omci_auth"
         ) {
@@ -139,6 +141,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "wan_downstream",
                 "onu_bridge",
             ],
+            "ports" => &["enabled", "count"],
             "mqtt" => &["enabled", "hl202_enabled", "ty_fs803g_enabled"],
             _ => &[],
         };

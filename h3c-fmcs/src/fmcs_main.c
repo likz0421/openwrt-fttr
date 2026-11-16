@@ -175,7 +175,8 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		u32 channel;
 		if (copy_from_user(&op, (void __user *)arg, sizeof(op)))
 			return -EFAULT;
-		if (op.addr > 15 || (op.val && op.val != 0x100 + op.addr))
+		if (op.addr >= priv->fttr_port_count || op.addr >= FMCS_MAX_FTTR_PORTS ||
+		    (op.val && op.val != 0x100 + op.addr))
 			return -EINVAL;
 		channel = op.val;
 		mutex_lock(&priv->lock);
@@ -688,7 +689,21 @@ static struct platform_driver fmcs_driver = {
 	},
 };
 
-module_platform_driver(fmcs_driver);
+static int __init fmcs_init(void)
+{
+	int ret = fmcs_netdevs_validate_params();
+
+	if (ret)
+		return ret;
+	return platform_driver_register(&fmcs_driver);
+}
+
+static void __exit fmcs_exit(void)
+{
+	platform_driver_unregister(&fmcs_driver);
+}
+module_init(fmcs_init);
+module_exit(fmcs_exit);
 
 MODULE_AUTHOR("LazuliKao");
 MODULE_DESCRIPTION("H3C HM2004-DU Micro-OLT FPGA Management Driver");

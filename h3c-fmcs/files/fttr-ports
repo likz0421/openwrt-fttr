@@ -1,0 +1,103 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Immutable netdev topology: prepare next boot, never unload a live driver.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+fail() {
+	echo "fttr-ports: $*" >&2
+	exit 1
+}
+
+# No setuid entry point. A test root may only be selected by an existing root.
+[ "$(/usr/bin/id -u)" = 0 ] || fail "root is required"
+root=${FTTR_PORTS_ROOT:-}
+case "$root" in
+	'') ;;
+	/*) [ -d "$root" ] || fail "test root is not a directory" ;;
+	*) fail "test root must be absolute" ;;
+esac
+case "${1:-}" in
+	prepare|load) action=$1 ;;
+	*) fail "usage: fttr-ports prepare|load" ;;
+esac
+[ "$#" = 1 ] || fail "usage: fttr-ports prepare|load"
+
+state="$root/run/fttr-ports"
+uci="$root/sbin/uci"
+parameter="$root/sys/module/h3c_fmcs/parameters/port_count"
+mkdir -p "$state/modules" || fail "cannot create runtime directory"
+mkdir "$state/lock" 2>/dev/null || fail "another preparation is in progress"
+trap 'rm -f "$state/uci-show"; rmdir "$state/lock"' EXIT
+trap 'exit 1' HUP INT TERM
+# Fail closed, including after an earlier valid prepare.
+rm -f "$state/modules/19-h3c-fmcs" "$state/desired"
+
+count=16
+enabled=1
+if [ -e "$root/etc/config/fttr" ]; then
+	# UCI parses syntax; never evaluate exported shell text or values as code.
+	"$uci" -c "$root/etc/config" -q show fttr > "$state/uci-show" ||
+		fail "invalid fttr configuration"
+	found=0
+	while IFS= read -r line; do
+		case "$line" in
+			fttr.ports=ports) found=$((found + 1)) ;;
+			fttr.ports=*) fail "ports section must have type ports" ;;
+			fttr.*=ports) fail "use one named config ports 'ports' section" ;;
+			fttr.ports.enabled=*|fttr.ports.count=*) ;;
+			fttr.ports.*) fail "unknown ports option" ;;
+		esac
+	done < "$state/uci-show"
+	[ "$found" -le 1 ] || fail "duplicate ports section"
+	if [ "$found" = 1 ]; then
+		value=$("$uci" -c "$root/etc/config" -q get fttr.ports.enabled) || value=
+		case "$value" in
+			''|1|true|yes|on) enabled=1 ;;
+			0|false|no|off) enabled=0 ;;
+			*) fail "ports enabled must be a boolean" ;;
+		esac
+		value=$("$uci" -c "$root/etc/config" -q get fttr.ports.count) || value=
+		if [ -n "$value" ]; then
+			case "$value" in *[!0-9]*) fail "ports count must be 1..16" ;; esac
+			# Decimal only, including leading zeros; do not use shell octal parsing.
+			while [ "${value#0}" != "$value" ]; do value=${value#0}; done
+			case "$value" in
+				[1-9]|1[0-6]) count=$value ;;
+				*) fail "ports count must be 1..16" ;;
+			esac
+		fi
+	fi
+fi
+[ "$enabled" = 1 ] || count=0
+printf '%s\n' "$count" > "$state/desired" || fail "cannot save desired count"
+printf 'h3c-fmcs port_count=%s\n' "$count" > "$state/modules/19-h3c-fmcs" ||
+	fail "cannot prepare module parameters"
+
+report_loaded() {
+	if [ -e "$parameter" ]; then
+		IFS= read -r running < "$parameter" || fail "cannot read running port_count"
+		case "$running" in 0|[1-9]|1[0-6]) ;; *) fail "invalid running port_count" ;; esac
+		pending=1
+		[ "$running" = "$count" ] && pending=0
+		echo "fttr-ports: desired=$count running=$running pending=$pending (changes require reboot)"
+		return 0
+	fi
+	if [ -d "$root/sys/module/h3c_fmcs" ]; then
+		echo "fttr-ports: desired=$count running=unknown pending=1 (legacy driver; reboot required)"
+		return 0
+	fi
+	return 1
+}
+
+report_loaded && exit 0
+if [ "$action" = prepare ]; then
+	echo "fttr-ports: desired=$count running=unloaded pending=1 (prepared for boot)"
+	exit 0
+fi
+# The trailing slash is required: kmodloader appends '*'. It resolves dependencies.
+"$root/sbin/kmodloader" "$state/modules/" || fail "kmodloader failed"
+[ -e "$parameter" ] || fail "driver did not expose port_count after loading"
+report_loaded || fail "driver is not loaded"
+[ "$running" = "$count" ] || fail "driver loaded with different parameters; reboot required"

@@ -142,6 +142,7 @@ struct fmcs_priv {
 	u16 omci_channel[16];
 	struct net_device *ploam_dev;
 	struct net_device *fttr_devs[FMCS_MAX_FTTR_PORTS];
+	unsigned int fttr_port_count; /* immutable after netdev initialization */
 	/* Published after all lower/upper links exist; protected by RTNL/RCU. */
 	struct net_device __rcu *fttr_lower;
 	struct notifier_block fttr_netdev_nb;
@@ -168,6 +169,20 @@ struct fmcs_priv {
 	struct work_struct ploam_tx_work;
 };
 
+/* Check the index before looking up an optional netdev slot. */
+static inline bool fmcs_fttr_port_valid(const struct fmcs_priv *priv,
+					unsigned int port)
+{
+	return port >= 1 && port <= priv->fttr_port_count &&
+	       port <= FMCS_MAX_FTTR_PORTS && priv->fttr_devs[port - 1];
+}
+
+static inline unsigned int fmcs_fttr_port_mask(unsigned int count)
+{
+	/* count == 0 is valid; never use GENMASK(count - 1, 0). */
+	return count <= FMCS_MAX_FTTR_PORTS ? (1U << count) - 1 : 0;
+}
+
 /* Function Prototypes */
 int fmcs_spi_write_fpga_reg(struct fmcs_priv *priv, u32 addr, u32 val);
 int fmcs_spi_read_fpga_reg(struct fmcs_priv *priv, u32 addr, u32 *val);
@@ -176,6 +191,7 @@ int fmcs_spi_read_bosa_reg(struct fmcs_priv *priv, u32 addr, u32 *val);
 int fmcs_spi_send_ploam(struct fmcs_priv *priv, const u8 *data, size_t len);
 int fmcs_spi_recv_ploam(struct fmcs_priv *priv, u8 *data, size_t *len);
 
+int fmcs_netdevs_validate_params(void);
 int fmcs_netdevs_init(struct fmcs_priv *priv);
 void fmcs_netdevs_exit(struct fmcs_priv *priv);
 int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrier);

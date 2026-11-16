@@ -110,7 +110,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     super::templates::compile(text)
 }
 /// Decode UCI once at the input boundary; compilers pass sections directly.
-pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, String> {
+pub(crate) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, String> {
     let mut sections = Vec::<(String, Section)>::new();
     for line in text.lines() {
         let w = words(line)?;

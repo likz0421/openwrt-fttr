@@ -7,6 +7,10 @@ pub fn setup_bridge(resources: &Resources, bridge: &str) -> io::Result<()> {
         link(&["set", interface, "up"])?;
     }
     for interface in resources.downstream_interfaces {
+        // Disabled boot-time slots do not have netdevs. Never recreate them here.
+        if !std::path::Path::new(&format!("/sys/class/net/{interface}")).exists() {
+            continue;
+        }
         link(&["set", interface, "up"])?;
         link(&["set", interface, "master", bridge])?;
     }

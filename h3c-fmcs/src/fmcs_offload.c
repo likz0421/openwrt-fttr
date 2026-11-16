@@ -49,7 +49,7 @@ static int fmcs_bridge_port(struct fmcs_priv *priv, int ifindex)
 {
 	int i;
 
-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
+	for (i = 0; i < priv->fttr_port_count; i++)
 		if (priv->fttr_devs[i] && priv->fttr_devs[i]->ifindex == ifindex)
 			return i + 1;
 	return 0;

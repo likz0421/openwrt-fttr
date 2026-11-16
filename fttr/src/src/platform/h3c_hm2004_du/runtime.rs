@@ -530,7 +530,13 @@ async fn run_async(platform: PlatformContext) {
 
     // 1. Data Structures & IPC Socket Server (Start immediately so fttrctl can query)
     let devices: Arc<Mutex<Vec<SubDevice>>> = Arc::new(Mutex::new(Vec::new()));
-    let pon_engine = Arc::new(Mutex::new(PonEngine::new(platform.resources())));
+    let capacity = crate::ports::runtime_count(
+        std::path::Path::new("/sys/module/h3c_fmcs/parameters/port_count"),
+        std::path::Path::new("/sys/class/net"),
+    );
+    let pon_engine = Arc::new(Mutex::new(
+        PonEngine::new(platform.resources()).with_capacity(capacity as usize),
+    ));
     super::service::init_pon_engine(pon_engine.clone());
     crate::provisioning::start(pon_engine.clone());
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));

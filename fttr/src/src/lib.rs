@@ -33,6 +33,7 @@ pub mod omci_auth;
 pub mod optical;
 pub mod platform;
 pub mod pon_engine;
+pub(crate) mod ports;
 pub mod provisioning;
 pub mod provisioning_cli;
 mod runtime;

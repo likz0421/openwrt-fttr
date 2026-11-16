@@ -22,12 +22,56 @@ pub struct PonEngine {
     pub active_onus: Vec<GponOnu>,
     pub(crate) onu_pins: std::collections::BTreeMap<String, u8>,
     pub(crate) pin_error: Option<String>,
+    pub(crate) capacity: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     const ONU_SLOTS: u8 = 16;
+
+    #[test]
+    fn ghost_empty_or_broadcast_identity_never_enters_inventory() {
+        for vendor in [[0; 4], [0xff; 4], *b"    ", *b"\0EST"] {
+            let mut engine = test_engine();
+            assert!(engine.register_onu(vendor, [0; 4]).is_none());
+            assert!(engine.active_onus.is_empty());
+        }
+        // Unknown equipment is still a real entity; the vendor is not an allowlist.
+        let mut engine = test_engine();
+        let first = engine.register_onu(*b"ZZ99", [0; 4]).unwrap();
+        let repeat = engine.register_onu(*b"ZZ99", [0; 4]).unwrap();
+        assert_eq!(first.onu_id, repeat.onu_id);
+        assert_eq!(first.full_sn_str(), "ZZ9900000000");
+        assert_eq!(engine.active_onus.len(), 1);
+    }
+
+    #[test]
+    fn capacity_limits_admission_without_renumbering_pinned_serials() {
+        for capacity in [0, 1, 4, 16] {
+            let mut engine = test_engine().with_capacity(capacity);
+            for id in 0..capacity as u8 {
+                assert_eq!(
+                    engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap().onu_id,
+                    id
+                );
+            }
+            assert!(engine.register_onu(*b"TEST", [0, 0, 0, 99]).is_none());
+            assert_eq!(engine.active_onus.len(), capacity);
+        }
+        let mut engine = test_engine().with_capacity(4);
+        engine.onu_pins.insert("TEST00000001".into(), 15);
+        assert!(engine.register_onu(*b"TEST", [0, 0, 0, 1]).is_none());
+        engine.onu_pins.insert("TEST00000002".into(), 3);
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 2]).unwrap().onu_id,
+            3
+        );
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 3]).unwrap().onu_id,
+            0
+        );
+    }
 
     #[test]
     fn pins_reserve_offline_slots_and_survive_reordered_discovery_after_restart() {
@@ -245,7 +289,15 @@ impl PonEngine {
             active_onus: Vec::new(),
             onu_pins: Default::default(),
             pin_error: None,
+            capacity: resources.onu_ids.len(),
         }
+    }
+
+    /// Limit admission to an immutable prefix of platform slots. Applied only at startup.
+    /// Slot IDs and existing serial reservations are never renumbered.
+    pub(crate) fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity.min(self.resources.onu_ids.len());
+        self
     }
 
     /// Processes an ONU discovered on the PON link (from upstream PLOAM or auto-ranging)
@@ -258,6 +310,12 @@ impl PonEngine {
         vendor: [u8; 4],
         sn: [u8; 4],
     ) -> Result<GponOnu, String> {
+        // G.984 serial numbers carry a four-character vendor identifier. Reject
+        // empty/broadcast/control bytes before creating identity or allocating a slot.
+        // The vendor is not an adapter allowlist and the binary suffix may be zero.
+        if !vendor.iter().all(u8::is_ascii_alphanumeric) {
+            return Err("invalid optical vendor identifier".into());
+        }
         if let Some(error) = &self.pin_error {
             return Err(format!(
                 "allocation blocked by startup configuration: {error}"
@@ -274,7 +332,7 @@ impl PonEngine {
             .full_sn_str()
             .to_ascii_uppercase();
         let id = match self.onu_pins.get(&identity) {
-            Some(&id) if self.resources.onu_ids.contains(&id) => id,
+            Some(&id) if self.resources.onu_ids[..self.capacity].contains(&id) => id,
             Some(&id) => {
                 return Err(format!(
                     "reserved ONU-ID {id} is unavailable on this platform"
@@ -284,6 +342,7 @@ impl PonEngine {
                 .resources
                 .onu_ids
                 .iter()
+                .take(self.capacity)
                 .copied()
                 .find(|id| {
                     !self.onu_pins.values().any(|reserved| reserved == id)
@@ -292,7 +351,7 @@ impl PonEngine {
                 .ok_or_else(|| {
                     format!(
                         "{identity}: all {} slots are occupied or reserved",
-                        self.resources.onu_ids.len()
+                        self.capacity
                     )
                 })?,
         };

@@ -5,7 +5,7 @@
 //! defines internal types, `policy` centralizes WAN protection, and `storage`
 //! provides persistence mechanics without choosing formats or retry behavior.
 pub(crate) use crate::bootstrap;
-mod config;
+pub(crate) mod config;
 pub(crate) use config::words as uci_words;
 pub(crate) mod command;
 pub(crate) mod controller;

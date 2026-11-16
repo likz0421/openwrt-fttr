@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+# S10 boot mounts /run and applies UCI defaults; S20 network creates bridges.
+START=19
+
+start() {
+	/usr/libexec/fttr-ports load
+}
+
+reload() {
+	/usr/libexec/fttr-ports prepare
+}
+
+stop() {
+	# Existing OMCI/PLOAM and network users keep the driver until reboot.
+	return 0
+}

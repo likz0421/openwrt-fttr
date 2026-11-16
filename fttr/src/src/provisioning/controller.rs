@@ -567,6 +567,7 @@ pub fn control(request: &str) -> String {
                     c.pending_config = None;
                     c.config_error = Some(error.clone());
                 })?;
+                crate::ports::prepare_boot()?;
                 c.request_config(cfg);
                 // The scheduler compares each device's operation revision with
                 // the desired revision. One unavailable device must not consume

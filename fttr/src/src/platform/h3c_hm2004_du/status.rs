@@ -23,6 +23,7 @@ pub(super) fn snapshot(
         .unwrap_or_default()
         .as_secs();
     let switch_ports = (1..=16u8)
+        .filter(|port| std::path::Path::new(&format!("/sys/class/net/fttr{port}")).exists())
         .map(|port| {
             let interface = format!("fttr{port}");
             let onu = engine.active_onus.iter().find(|onu| onu.onu_id == port - 1);

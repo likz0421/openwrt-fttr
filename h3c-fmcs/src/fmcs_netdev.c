@@ -12,6 +12,7 @@
 #include <linux/if_arp.h>
 #include <linux/of_net.h>
 #include <linux/rtnetlink.h>
+#include <linux/version.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/switchdev.h>
 #include "fmcs.h"
@@ -647,6 +648,14 @@ static int fmcs_fttr_change_mtu(struct net_device *dev, int mtu)
 	return 0;
 }
 
+/* dev_fill_bridge_path() was added by ponwrt's 675-06 bridge flowtable
+ * series (upstream equivalent in Linux 6.13).  On 6.12 without that
+ * backport there is no bridge-path resolution caller, so the heuristic
+ * that distinguishes bridge from routed forward-path queries is moot.
+ * Return false unconditionally: ndo_fill_forward_path is only invoked
+ * by dev_fill_forward_path(), never by a bridge flowtable resolver.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 static inline bool fmcs_in_bridge_path(void)
 {
 	void *ret0 = __builtin_return_address(0);
@@ -659,6 +668,12 @@ static inline bool fmcs_in_bridge_path(void)
 
 	return false;
 }
+#else
+static inline bool fmcs_in_bridge_path(void)
+{
+	return false;
+}
+#endif
 
 static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 				      struct net_device_path *path)

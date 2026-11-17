@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
@@ -442,7 +443,12 @@ static ssize_t reload_fpga_store(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_WO(reload_fpga);
 
+/* device_find_child() made the match data const in Linux 6.14. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+static int fmcs_match_spi_child(struct device *dev, void *data)
+#else
 static int fmcs_match_spi_child(struct device *dev, const void *data)
+#endif
 {
 	return dev->class && !strcmp(dev->class->name, "spi_master");
 }

@@ -136,6 +136,13 @@ pub(crate) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, Strin
             }
             "option" | "list" if w.len() == 3 => {
                 let section = &mut sections.last_mut().ok_or("option without section")?.1;
+                // Preserve scalar-only ports semantics before option/list values
+                // are flattened. Other sections retain their existing behavior.
+                if section.kind == "ports"
+                    && (w[0] != "option" || section.options.contains_key(&w[1]))
+                {
+                    return Err("ports requires unique scalar enabled and count options".into());
+                }
                 if (section.kind == "omci_auth" || section.kind == "device")
                     && (w[1].starts_with("auth_") || w[1] == "schema_version")
                     && (w[0] != "option" || section.options.contains_key(&w[1]))
@@ -722,6 +729,29 @@ mod tests {
             .contains("TR069"));
         assert!(normalize_custom_vlan_service_list(&["UNKNOWN".into()]).is_err());
     }
+    #[test]
+    fn non_ports_option_and_list_semantics_are_unchanged() {
+        let sections = parse_sections(
+            "config offload offload\nlist count 4\nlist count 16\n\
+             option enabled 0\noption enabled 1\n\
+             list replaced old\noption replaced new\n\
+             option appended first\nlist appended second",
+        )
+        .unwrap();
+        let section = &sections[0].1;
+        assert_eq!(section.options["count"], ["4", "16"]);
+        assert_eq!(section.options["enabled"], ["1"]);
+        assert_eq!(section.options["replaced"], ["new"]);
+        assert_eq!(section.options["appended"], ["first", "second"]);
+        let cfg =
+            parse("config provisioning global\nlist trigger program_start\nlist trigger periodic")
+                .unwrap();
+        assert_eq!(
+            cfg.triggers,
+            BTreeSet::from(["program_start".into(), "periodic".into()])
+        );
+    }
+
     #[test]
     fn quoted_export() {
         assert_eq!(

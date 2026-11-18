@@ -189,6 +189,25 @@ pub(crate) fn management_result(serial: &str, result: Value) {
     }
 }
 impl Controller {
+    fn reload_config(
+        &mut self,
+        load: impl FnOnce() -> Result<Config, String>,
+        prepare_boot: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let cfg = load()
+            .and_then(|cfg| {
+                prepare_boot()?;
+                Ok(cfg)
+            })
+            .inspect_err(|error| {
+                // Any rejected newer reload must discard an older queued revision.
+                self.pending_config = None;
+                self.config_error = Some(error.clone());
+            })?;
+        self.request_config(cfg);
+        Ok(())
+    }
+
     fn omci_management_view(&self, device: &Device) -> Value {
         if !device.omci_management() {
             json!({"state":"disabled","enabled":false,"reason":"OMCI management provisioning is disabled for this device"})
@@ -562,13 +581,7 @@ pub fn control(request: &str) -> String {
             }
             "reload" => {
                 let mut c = controller().lock().unwrap();
-                let cfg = config::load().inspect_err(|error| {
-                    // An invalid newer commit must not activate an older queued revision.
-                    c.pending_config = None;
-                    c.config_error = Some(error.clone());
-                })?;
-                crate::ports::prepare_boot()?;
-                c.request_config(cfg);
+                c.reload_config(config::load, crate::ports::prepare_boot)?;
                 // The scheduler compares each device's operation revision with
                 // the desired revision. One unavailable device must not consume
                 // the config-change trigger for every other device.
@@ -728,6 +741,105 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_reload_discards_old_pending_even_after_operations_drain() {
+        for failed_step in ["load", "prepare"] {
+            let mut c = Controller::default();
+            c.config.revision = "active".into();
+            c.operations
+                .insert("child".into(), operation(OperationPhase::Writing, false));
+            let mut queued = c.config.clone();
+            queued.revision = "queued".into();
+            c.reload_config(|| Ok(queued), || Ok(())).unwrap();
+            assert_eq!(c.pending_config.as_ref().unwrap().0.revision, "queued");
+            assert_eq!(c.config.revision, "active");
+
+            let mut latest = c.config.clone();
+            latest.revision = "latest".into();
+            let message = format!("{failed_step} failed");
+            let prepared = std::cell::Cell::new(false);
+            let result = c.reload_config(
+                || {
+                    if failed_step == "load" {
+                        Err(message.clone())
+                    } else {
+                        Ok(latest)
+                    }
+                },
+                || {
+                    prepared.set(true);
+                    Err(message.clone())
+                },
+            );
+            assert_eq!(result, Err(message.clone()));
+            assert_eq!(prepared.get(), failed_step == "prepare");
+            assert!(c.pending_config.is_none());
+            assert_eq!(c.config_error.as_deref(), Some(message.as_str()));
+            assert_eq!(c.snapshot()["config_error"], message.as_str());
+            assert_eq!(c.config.revision, "active");
+            assert_eq!(c.operations["child"].stage, OperationPhase::Writing);
+
+            c.operations.get_mut("child").unwrap().complete(100);
+            // This is the same activation method called by the scheduler.
+            assert!(!c.activate_pending_config());
+            assert!(c.pending_config.is_none());
+            assert_eq!(c.config.revision, "active");
+            assert_eq!(c.config_error.as_deref(), Some(message.as_str()));
+        }
+    }
+
+    #[test]
+    fn valid_reload_applies_parsed_ports_and_legacy_configs_and_clears_error() {
+        for text in ["config ports ports\noption count 4", ""] {
+            let mut c = Controller::default();
+            c.config.revision = "active".into();
+            let mut stale = c.config.clone();
+            stale.revision = "stale".into();
+            c.pending_config = Some((stale, 1));
+            c.config_error = Some("previous prepare failure".into());
+            let expected = config::parse(text).unwrap().revision;
+            let prepared = std::cell::Cell::new(false);
+            c.reload_config(
+                || config::parse(text),
+                || {
+                    prepared.set(true);
+                    assert_eq!(
+                        crate::ports::parse(text).unwrap().active(),
+                        if text.is_empty() { 16 } else { 4 }
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(prepared.get());
+            assert!(c.config_error.is_none());
+            assert!(c.pending_config.is_none());
+            assert_eq!(c.config.revision, expected);
+            assert_eq!(c.config_load_view()["state"], "applied");
+        }
+    }
+
+    #[test]
+    fn valid_reload_waits_for_drain_then_applies_latest_revision() {
+        let mut c = Controller::default();
+        c.config.revision = "active".into();
+        c.operations
+            .insert("child".into(), operation(OperationPhase::Writing, false));
+        let mut cfg = c.config.clone();
+        cfg.revision = "latest".into();
+        c.config_error = Some("previous prepare failure".into());
+        c.reload_config(|| Ok(cfg), || Ok(())).unwrap();
+        assert!(c.config_error.is_none());
+        assert_eq!(c.pending_config.as_ref().unwrap().0.revision, "latest");
+        assert!(!c.activate_pending_config());
+        assert_eq!(c.config.revision, "active");
+        c.operations.get_mut("child").unwrap().complete(100);
+        assert!(c.activate_pending_config());
+        assert_eq!(c.config.revision, "latest");
+        assert!(c.pending_config.is_none());
+        assert!(c.config_error.is_none());
+    }
     #[test]
     fn device_reset_forgets_live_and_recovered_state_only_for_target() {
         let op = operation(OperationPhase::Writing, false);

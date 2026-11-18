@@ -447,7 +447,19 @@ fn restore_optical_state(
     }
 }
 
-fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
+// Use the same immutable capacity as ONU admission, never pending UCI intent.
+// At capacity zero no per-ONU carrier, PLOAM, register or OMCI ioctl is issued.
+fn clear_startup_slots(
+    capacity: u8,
+    mut clear: impl FnMut(u8) -> io::Result<()>,
+) -> io::Result<()> {
+    for &id in super::RESOURCES.onu_ids.iter().take(usize::from(capacity)) {
+        clear(id)?;
+    }
+    Ok(())
+}
+
+fn initialize_hardware(stopping: &AtomicBool, capacity: u8) -> io::Result<OpticalState> {
     if stopping.load(Ordering::Acquire) {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -494,10 +506,7 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
             );
             applied?;
             setup_bridge()?;
-            for &id in crate::platform::h3c_hm2004_du::RESOURCES.onu_ids {
-                clear_offline_hardware(id)?;
-            }
-            Ok(())
+            clear_startup_slots(capacity, clear_offline_hardware)
         },
         bosa::set_optical_tx_enable,
     )
@@ -587,7 +596,7 @@ async fn run_async(platform: PlatformContext) {
             .stack_size(256 * 1024)
             .spawn(move || {
             println!("[+] Started background PLOAM discovery & reception loop.");
-            let initial = initialize_hardware(&stopping);
+            let initial = initialize_hardware(&stopping, capacity);
             let (ready, state) = match initial {
                 Ok(state) => (true, state),
                 Err(error) => {
@@ -1050,6 +1059,196 @@ async fn run_async(platform: PlatformContext) {
 mod lifecycle_tests {
     use super::*;
     use crate::pon_engine::ploam::PloamFrame;
+
+    #[test]
+    fn startup_capacity_cleans_only_registered_slots_including_disabled_zero() {
+        for capacity in [0u8, 1, 4, 16] {
+            let stopping = AtomicBool::new(false);
+            let mut cleared = Vec::new();
+            let mut writes = Vec::new();
+            let state = restore_optical_state(
+                Ok(true),
+                &stopping,
+                || {
+                    clear_startup_slots(capacity, |id| {
+                        // Models the driver's strict carrier and OMCI ioctl boundary.
+                        assert!(id < capacity, "cleanup reached an unregistered port");
+                        cleared.push(id);
+                        Ok(())
+                    })
+                },
+                |enabled| {
+                    writes.push(enabled);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(state == OpticalState::Enabled);
+            assert_eq!(cleared, (0..capacity).collect::<Vec<_>>());
+            assert_eq!(writes, [false, true]);
+        }
+        clear_startup_slots(0, |_| panic!("disabled ports must issue no cleanup ioctl")).unwrap();
+    }
+
+    #[test]
+    fn startup_capacity_preserves_cleanup_errors_and_never_enables_after_failure() {
+        for capacity in [1u8, 4, 16] {
+            let stopping = AtomicBool::new(false);
+            let mut cleared = Vec::new();
+            let mut writes = Vec::new();
+            let error = restore_optical_state(
+                Ok(true),
+                &stopping,
+                || {
+                    clear_startup_slots(capacity, |id| {
+                        cleared.push(id);
+                        Err(io::Error::from_raw_os_error(22))
+                    })
+                },
+                |enabled| {
+                    writes.push(enabled);
+                    Ok(())
+                },
+            )
+            .err()
+            .expect("cleanup failure must be returned");
+            assert_eq!(error.raw_os_error(), Some(22));
+            assert_eq!(cleared, [0]);
+            assert_eq!(writes, [false]);
+        }
+    }
+
+    #[test]
+    fn startup_capacity_reconfigure_and_rediscovery_keep_slot_bounds() {
+        struct Reconfigure<'a> {
+            runtime: RuntimeOptics<'a>,
+            lowered: Vec<u8>,
+            capacity: u8,
+            desired: bool,
+            tx: bool,
+        }
+        impl OpticalBackend for Reconfigure<'_> {
+            fn ready(&self) -> bool {
+                true
+            }
+            fn cleanup_pending(&self) -> bool {
+                !self.runtime.pending_cleanup.is_empty()
+            }
+            fn desired(&self) -> io::Result<bool> {
+                Ok(self.desired)
+            }
+            fn save(&mut self, enabled: bool) -> io::Result<()> {
+                self.desired = enabled;
+                Ok(())
+            }
+            fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
+                self.tx = enabled;
+                Ok(())
+            }
+            fn read_tx(&mut self) -> io::Result<bool> {
+                Ok(self.tx)
+            }
+            fn quiesce(&mut self) -> io::Result<()> {
+                let capacity = self.capacity;
+                let lowered = &mut self.lowered;
+                self.runtime.quiesce_with(|id| {
+                    assert!(id < capacity);
+                    lowered.push(id);
+                    Ok(())
+                })
+            }
+        }
+        for capacity in [0u8, 1, 4, 16] {
+            let engine =
+                Mutex::new(crate::pon_engine::test_engine().with_capacity(usize::from(capacity)));
+            let mut services = super::super::service::Services::new(
+                PlatformContext::test_context(),
+                Arc::new(Mutex::new(BTreeMap::new())),
+            );
+            // Reinitialize/reload quiesce existing registrations; rediscovery must
+            // revive their IDs without expanding capacity or admitting new slots.
+            for _ in 0..2 {
+                let now = Instant::now();
+                let mut online = BTreeMap::new();
+                let mut ranging = None;
+                for id in 0..capacity {
+                    let onu = engine
+                        .lock()
+                        .unwrap()
+                        .register_onu(*b"TEST", [0, 0, 0, id])
+                        .unwrap();
+                    assert_eq!(onu.onu_id, id);
+                    let session = RangingSession {
+                        id,
+                        serial: [0; 8],
+                        started: now,
+                        armed: false,
+                        matched: false,
+                        measured: None,
+                        ranged: None,
+                        allocated: false,
+                        confirmed: false,
+                        last_valid_rx: now,
+                    };
+                    if id + 1 == capacity {
+                        ranging = Some(session);
+                    } else {
+                        online.insert(id, session);
+                    }
+                }
+                assert!(engine
+                    .lock()
+                    .unwrap()
+                    .register_onu(*b"TEST", [0, 0, 0, 99])
+                    .is_none());
+                let mut pending_cleanup = BTreeSet::new();
+                let mut backend = Reconfigure {
+                    runtime: RuntimeOptics {
+                        ready: true,
+                        ranging: &mut ranging,
+                        online: &mut online,
+                        pending_cleanup: &mut pending_cleanup,
+                        services: &mut services,
+                        engine: &engine,
+                    },
+                    lowered: Vec::new(),
+                    capacity,
+                    desired: true,
+                    tx: true,
+                };
+                let mut actor = OpticalActor {
+                    state: OpticalState::Enabled,
+                };
+                let reply = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+                assert_eq!(reply["status"], "success");
+                assert_eq!(backend.lowered, (0..capacity).collect::<Vec<_>>());
+                backend.lowered.clear();
+                // A reload to disabled then On uses the same admitted slots.
+                backend.desired = false;
+                assert_eq!(
+                    actor.handle(OpticalCommand::Reload, &mut backend)["status"],
+                    "success"
+                );
+                assert_eq!(backend.lowered, (0..capacity).collect::<Vec<_>>());
+                backend.lowered.clear();
+                assert_eq!(
+                    actor.handle(OpticalCommand::On, &mut backend)["status"],
+                    "success"
+                );
+                assert!(backend.lowered.is_empty());
+                drop(backend);
+                assert!(online.is_empty());
+                assert!(ranging.is_none());
+                assert_eq!(pending_cleanup, (0..capacity).collect::<BTreeSet<_>>());
+                let engine = engine.lock().unwrap();
+                assert_eq!(engine.active_onus.len(), usize::from(capacity));
+                assert!(engine
+                    .active_onus
+                    .iter()
+                    .all(|onu| { onu.onu_id < capacity && onu.state == OnuState::O1Initial }));
+            }
+        }
+    }
 
     #[test]
     fn optical_boot_restores_off_without_any_enable_and_stop_interrupts_restore() {

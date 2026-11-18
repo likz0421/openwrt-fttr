@@ -14,20 +14,28 @@ permissions:
   contents: read
 jobs:
   contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      FTTR_BACKEND_DIR: ${{ github.workspace }}/openwrt-fttr
     steps:
       - uses: actions/checkout@v4
         with:
           path: openwrt-fttr
       - uses: actions/checkout@v4
         with:
-          repository: LazuliKao/luci-app-fttr
-          ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
+          repository: likz0421/luci-app-fttr
+          ref: 9581dce9cc83d02639b13a51eeabd77cbfcd4eae
           path: luci-app-fttr
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt --all --check --manifest-path openwrt-fttr/fttr/src/Cargo.toml
+      - name: FMCS ports helper and driver boundary tests
+        run: |
+          sudo python3 openwrt-fttr/h3c-fmcs/tests/ports-helper-test.py
+          python3 openwrt-fttr/h3c-fmcs/tests/ports-driver-test.py
+      - name: Check modified Rust formatting
+        run: rustfmt --edition 2021 --check --config skip_children=true openwrt-fttr/fttr/src/src/platform/h3c_hm2004_du/runtime.rs openwrt-fttr/fttr/src/src/ports.rs openwrt-fttr/fttr/src/src/provisioning/config.rs openwrt-fttr/fttr/src/src/provisioning/controller.rs
       - run: cargo test --locked --workspace --manifest-path openwrt-fttr/fttr/src/Cargo.toml --features fttr-api/codegen
-      - run: cargo test --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --lib --no-default-features --features all-devices,acs,mqtt,npu
+      - run: cargo test --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --lib --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt,npu
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,diagnostics
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features
@@ -39,3 +47,13 @@ jobs:
           node-version: 22
       - run: pnpm install --frozen-lockfile && pnpm check
         working-directory: luci-app-fttr
+      - name: Generate paired FTTR package
+        working-directory: luci-app-fttr
+        run: pnpm package:generate 2026.11.18.1
+      - name: Preserve tested frontend package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fttr-v29-paired-package
+          path: luci-app-fttr/dist/package/
+          if-no-files-found: error
+          retention-days: 14

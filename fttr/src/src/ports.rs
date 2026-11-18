@@ -28,11 +28,13 @@ impl Ports {
 
 pub(crate) fn parse(text: &str) -> Result<Ports, String> {
     let sections = crate::provisioning::config::parse_sections(text)?;
-    let mut found = sections.iter().filter(|(_, s)| s.kind == "ports");
+    let mut found = sections
+        .iter()
+        .filter(|(name, s)| name == "ports" || s.kind == "ports");
     let Some((name, s)) = found.next() else {
         return Ok(Ports::default());
     };
-    if name != "ports" || found.next().is_some() {
+    if name != "ports" || s.kind != "ports" || found.next().is_some() {
         return Err("use one named config ports 'ports' section".into());
     }
     for (key, values) in &s.options {
@@ -93,6 +95,82 @@ pub(crate) fn prepare_boot() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_malformed_sections_and_non_scalar_ports_at_both_entrypoints() {
+        for text in [
+            "config offload 'ports'",
+            "config ports",
+            "config ports wrong",
+            "config ports ports\nconfig ports ports",
+            "config ports ports\nconfig ports other",
+            "config offload ports\nconfig ports other",
+            "config ports ports\noption unknown 4",
+            "config ports ports\nlist count 4",
+            "config ports ports\nlist enabled 1",
+            "config ports ports\nlist count 4\noption count 4",
+            "config ports ports\noption count 4\nlist count 4",
+            "config ports ports\noption count 4\noption count 4",
+            "config ports ports\noption enabled 1\noption enabled 0",
+            "config ports ports\noption enabled maybe",
+            "config ports ports\noption enabled 0\noption count 17",
+        ] {
+            assert!(parse(text).is_err(), "ports accepted {text}");
+            assert!(
+                crate::provisioning::config::parse(text).is_err(),
+                "config accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_leading_zeros_match_boot_helper() {
+        for (value, expected) in [
+            ("01".to_owned(), 1),
+            ("0004".to_owned(), 4),
+            ("0016".to_owned(), 16),
+            (format!("{}4", "0".repeat(1024)), 4),
+        ] {
+            let text = format!("config ports ports\noption count '{value}'");
+            assert_eq!(parse(&text).unwrap().active(), expected);
+            assert!(crate::provisioning::config::parse(&text).is_ok());
+        }
+        for value in ["0000", "0017", "0256", "0x04", " 04", "04 "] {
+            let text = format!("config ports ports\noption count '{value}'");
+            assert!(parse(&text).is_err(), "{value}");
+            assert!(
+                crate::provisioning::config::parse(&text).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_without_ports_keeps_sixteen_and_other_lists() {
+        for text in [
+            "",
+            "config offload offload",
+            "config provisioning global\nlist trigger program_start\nlist trigger periodic",
+        ] {
+            assert_eq!(parse(text).unwrap(), Ports::default());
+            assert!(crate::provisioning::config::parse(text).is_ok());
+        }
+        for (value, active) in [
+            ("", 16),
+            ("1", 16),
+            ("true", 16),
+            ("yes", 16),
+            ("on", 16),
+            ("0", 0),
+            ("false", 0),
+            ("no", 0),
+            ("off", 0),
+        ] {
+            let text = format!("config ports ports\noption enabled '{value}'");
+            assert_eq!(parse(&text).unwrap().active(), active);
+            assert!(crate::provisioning::config::parse(&text).is_ok());
+        }
+    }
+
     #[test]
     fn legacy_disabled_and_capacity_boundaries() {
         assert_eq!(parse("").unwrap().active(), 16);

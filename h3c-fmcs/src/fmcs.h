@@ -111,7 +111,23 @@ enum fmcs_fpga_status {
 #define FMCS_SPI_CMD_READ_REQ     0xA0
 #define FMCS_SPI_CMD_READ_RESP    0x50
 
+/* Protocol/hardware ceiling: GEM 0x100..0x10f maps to ONU-ID 0..15 and the
+ * arrays below are sized for all 16 slots.  Never lower this: RX path indexes
+ * fttr_devs[] / omci_channel[] directly by (vlan_id - 0x100) up to 15. */
 #define FMCS_MAX_FTTR_PORTS 16
+
+/* Number of downstream netdevs (fttr1..fttrN) actually created at probe time.
+ * This is the knob to change how many fttr ports exist in the system; it must
+ * be >= 1 and <= FMCS_MAX_FTTR_PORTS.  Slots beyond N stay NULL (harmless:
+ * all loops and the RX path already guard on a non-NULL dev).  Build-time
+ * constant so no module parameter or runtime reconfiguration is needed. */
+#ifndef FMCS_ACTIVE_FTTR_PORTS
+#define FMCS_ACTIVE_FTTR_PORTS 2
+#endif
+#if FMCS_ACTIVE_FTTR_PORTS < 1 || FMCS_ACTIVE_FTTR_PORTS > FMCS_MAX_FTTR_PORTS
+#error "FMCS_ACTIVE_FTTR_PORTS must be between 1 and FMCS_MAX_FTTR_PORTS"
+#endif
+
 #define FMCS_FPGA_TRANSPORT_VID_BASE 0x100
 #define FMCS_PORT_TO_FPGA_VID(port)  ((u16)(FMCS_FPGA_TRANSPORT_VID_BASE + (port) - 1))
 #define FMCS_PLOAM_RX_DEPTH 64

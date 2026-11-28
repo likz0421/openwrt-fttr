@@ -143,7 +143,10 @@ fn populate_ppe_config(status: &mut NpuStatus, ppe_debug_path: &Path) {
 }
 
 fn populate_ppe_flows(status: &mut NpuStatus, ppe_debug_path: &Path) {
+    let mut bind_readable = false;
+    let mut bound_entries_seen = 0usize;
     if let Ok(bind_content) = fs::read_to_string(ppe_debug_path.join("bind")) {
+        bind_readable = true;
         status.flows_valid = true;
         status.counters_valid = true;
         for line in bind_content.lines() {
@@ -156,6 +159,7 @@ fn populate_ppe_flows(status: &mut NpuStatus, ppe_debug_path: &Path) {
                     status.flows_valid = false;
                     continue;
                 }
+                bound_entries_seen += 1;
                 status.counters_valid &= entry.counters_valid;
                 match (
                     status.total_packets.checked_add(entry.packets),
@@ -173,14 +177,20 @@ fn populate_ppe_flows(status: &mut NpuStatus, ppe_debug_path: &Path) {
             }
         }
     }
+    let had_traffic = bind_readable && bound_entries_seen > 0;
     status.counters_valid &= status.flows_valid && status.engine_valid && status.engine_attached;
     if !status.flows_valid {
         status.errors.push("PPE bind: read or parse failed".into());
     }
     if !status.counters_valid {
+        // An empty bind table (no transiting flow) is a normal idle state, not a
+        // counter failure. Only report a real error when a bound flow was sampled
+        // but its counters could not be parsed or overflowed.
+        if had_traffic {
         status
             .errors
-            .push("PPE counters: unavailable, invalid or overflowing".into());
+                .push("PPE counters: sampled flow had invalid or overflowing values".into());
+        }
     }
     status.total_packets_exact = status.total_packets.to_string();
     status.total_bytes_exact = status.total_bytes.to_string();

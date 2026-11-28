@@ -207,6 +207,22 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
             return Err("fiberhome rx_snapshot must be 0 or 1".into());
         }
     }
+    // H3C HM2004-DU local port count: one named `h3c` section, lan_ports 1..=2.
+    // Range matches the kmod's FMCS_ACTIVE_FTTR_PORTS (2 fttrX netdevs in this build).
+    // Kept as a listener-style option (like fiberhome) so it never gates business sync.
+    let h3c: Vec<_> = all.iter().filter(|(_, s)| s.kind == "h3c").collect();
+    if h3c.len() > 1 || h3c.first().is_some_and(|(id, _)| id != "h3c") {
+        return Err("h3c requires one named h3c section".into());
+    }
+    if let Some((_, s)) = h3c.first() {
+        let value = s.get("lan_ports");
+        if !value.is_empty() {
+            match value.parse::<u8>() {
+                Ok(n) if (1..=2).contains(&n) => {}
+                _ => return Err("h3c lan_ports must be 1..2".into()),
+            }
+        }
+    }
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
     }
@@ -252,11 +268,13 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
                 | "acs_redirect"
                 | "omci_auth"
                 | "fiberhome"
+                | "h3c"
         ) {
             return Err(format!("unsupported section: {}", s.kind));
         }
         let allowed: &[&str] = match s.kind.as_str() {
             "fiberhome" => &["onu_count", "rx_snapshot"],
+            "h3c" => &["lan_ports"],
             "mqtt_bridge" => &["enabled"],
             "acs_bridge" => &["enabled", "management_gateway"],
             "acs_redirect" => &[
@@ -659,7 +677,7 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
             canonical_section(&mut canonical, id, &business);
             if !matches!(
                 business.kind.as_str(),
-                "management" | "acs" | "omci_auth" | "mqtt_bridge" | "acs_bridge" | "acs_redirect"
+                "management" | "acs" | "omci_auth" | "mqtt_bridge" | "acs_bridge" | "acs_redirect" | "h3c"
             ) {
                 if business.kind == "device" {
                     business.options.retain(|key, _| {

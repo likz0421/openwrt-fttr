@@ -1,0 +1,154 @@
+diff --git a/h3c-fmcs/src/fmcs_netdev.c b/h3c-fmcs/src/fmcs_netdev.c
+index 63fea9b..0f58119 100644
+--- a/h3c-fmcs/src/fmcs_netdev.c
++++ b/h3c-fmcs/src/fmcs_netdev.c
+@@ -36,7 +36,7 @@ static void fmcs_offload_cleanup(struct fmcs_priv *priv)
+ 	int i;
+ 
+ 	ASSERT_RTNL();
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++)
+ 		if (priv->fttr_devs[i])
+ 			nf_flow_table_cleanup(priv->fttr_devs[i]);
+ 	if (lower)
+@@ -105,7 +105,7 @@ static int fmcs_bridge_event(struct notifier_block *nb, unsigned long event, voi
+ 	if (!mask || !priv)
+ 		return NOTIFY_DONE;
+ 	rcu_read_lock();
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		struct net_device *port = priv->fttr_devs[i];
+ 
+ 		if ((mask & BIT(i)) && port &&
+@@ -176,21 +176,35 @@ MODULE_PARM_DESC(bridge_offload_mask,
+ 
+ bool fmcs_bridge_port_enabled(struct fmcs_priv *priv, unsigned int port)
+ {
+-	struct net_device *dev = priv->fttr_devs[port - 1];
++	struct net_device *dev;
++
++	if (port < 1 || port > FMCS_ACTIVE_FTTR_PORTS)
++		return false;
++	dev = priv->fttr_devs[port - 1];
++	if (!dev)
++		return false;
+ 
+-	return (READ_ONCE(bridge_offload_mask) & BIT(port - 1)) && dev &&
++	return (READ_ONCE(bridge_offload_mask) & BIT(port - 1)) &&
+ 	       netif_running(dev) && netif_carrier_ok(dev);
+ }
+ 
+ bool fmcs_bridge_pair_enabled(struct fmcs_priv *priv, unsigned int src, unsigned int dst)
+ {
+-	unsigned int pair = BIT(src - 1) | BIT(dst - 1);
++	struct net_device *sdev, *ddev;
++	unsigned int pair;
++
++	if (src < 1 || src > FMCS_ACTIVE_FTTR_PORTS ||
++	    dst < 1 || dst > FMCS_ACTIVE_FTTR_PORTS)
++		return false;
++	sdev = priv->fttr_devs[src - 1];
++	ddev = priv->fttr_devs[dst - 1];
++	if (!sdev || !ddev)
++		return false;
++	pair = BIT(src - 1) | BIT(dst - 1);
+ 
+ 	return (READ_ONCE(bridge_offload_mask) & pair) == pair &&
+-	       netif_running(priv->fttr_devs[src - 1]) &&
+-	       netif_carrier_ok(priv->fttr_devs[src - 1]) &&
+-	       netif_running(priv->fttr_devs[dst - 1]) &&
+-	       netif_carrier_ok(priv->fttr_devs[dst - 1]);
++	       netif_running(sdev) && netif_carrier_ok(sdev) &&
++	       netif_running(ddev) && netif_carrier_ok(ddev);
+ }
+ 
+ /* Binding is by name only at discovery. Once bound, identity survives rename. */
+@@ -255,7 +269,7 @@ static void fmcs_lower_unlink(struct fmcs_priv *priv)
+ 	fmcs_offload_cleanup(priv);
+ 	nf_flow_table_cleanup(lower);
+ 	fmcs_bridge_unbind(priv, lower);
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++)
+ 		netdev_upper_dev_unlink(lower, priv->fttr_devs[i]);
+ 	dev_put(lower);
+ }
+@@ -267,19 +281,19 @@ static int fmcs_lower_link(struct fmcs_priv *priv, struct net_device *lower)
+ 	ASSERT_RTNL();
+ 	if (lower->type != ARPHRD_ETHER || lower->mtu < ETH_MIN_MTU)
+ 		return -EINVAL;
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		ret = netdev_upper_dev_link(lower, priv->fttr_devs[i], NULL);
+ 		if (ret)
+ 			goto rollback;
+ 	}
+ 	/* All ports are registered before the notifier's initial replay. */
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		struct net_device *port = priv->fttr_devs[i];
+ 
+ 		if (port->mtu > lower->mtu) {
+ 			ret = dev_set_mtu(port, lower->mtu);
+ 			if (ret) {
+-				i = FMCS_MAX_FTTR_PORTS;
++				i = FMCS_ACTIVE_FTTR_PORTS;
+ 				goto rollback;
+ 			}
+ 		}
+@@ -288,7 +302,7 @@ static int fmcs_lower_link(struct fmcs_priv *priv, struct net_device *lower)
+ 	}
+ 	ret = netdev_rx_handler_register(lower, fmcs_handle_frame, priv);
+ 	if (ret) {
+-		i = FMCS_MAX_FTTR_PORTS;
++		i = FMCS_ACTIVE_FTTR_PORTS;
+ 		goto rollback;
+ 	}
+ 	dev_hold(lower);
+@@ -325,13 +339,13 @@ static int fmcs_netdev_event(struct notifier_block *nb,
+ 			struct netdev_notifier_info_ext *info = ptr;
+ 
+ 			/* Reject, rather than leave ports with an unusable MTU. */
+-			for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
++			for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++)
+ 				if (priv->fttr_devs[i]->mtu > info->ext.mtu)
+ 					return notifier_from_errno(-EBUSY);
+ 		}
+ 		return NOTIFY_OK;
+ 	}
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		if (dev != priv->fttr_devs[i] ||
+ 		    !((routed_offload_mask | READ_ONCE(bridge_offload_mask)) & BIT(i)))
+ 			continue;
+@@ -912,8 +926,11 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
+ 		goto err_unreg_fttr;
+ 	}
+ 
+-	/* Create downstream DSA-style switch ports fttr1 ~ fttr16 */
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	/* Create downstream DSA-style switch ports fttr1 ~ fttrN.
++	 * N is FMCS_ACTIVE_FTTR_PORTS (build-time); unused slots stay NULL.
++	 * The array itself stays at FMCS_MAX_FTTR_PORTS so every indexed access
++	 * in the RX path and offload path remains in bounds. */
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		char ifname[IFNAMSIZ];
+ 		struct net_device *dev;
+ 		struct fmcs_fttr_port_priv *port_priv;
+@@ -981,7 +998,7 @@ err_notifier:
+ 	rtnl_lock();
+ 	fmcs_lower_unlink(priv);
+ 	rtnl_unlock();
+-	i = FMCS_MAX_FTTR_PORTS;
++	i = FMCS_ACTIVE_FTTR_PORTS;
+ err_unreg_fttr:
+ 	while (--i >= 0) {
+ 		if (priv->fttr_devs[i]) {
+@@ -1015,7 +1032,7 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
+ 	fmcs_lower_unlink(priv);
+ 	rtnl_unlock();
+ 
+-	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
++	for (i = 0; i < FMCS_ACTIVE_FTTR_PORTS; i++) {
+ 		if (priv->fttr_devs[i]) {
+ 			unregister_netdev(priv->fttr_devs[i]);
+ 			free_netdev(priv->fttr_devs[i]);

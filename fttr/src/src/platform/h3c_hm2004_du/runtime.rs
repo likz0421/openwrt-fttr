@@ -109,8 +109,28 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 }
 
+/// Number of fttr downstream ports to keep in br-lan, from UCI
+/// `fttr.h3c.lan_ports` (1..=2, matching the kmod's FMCS_ACTIVE_FTTR_PORTS).
+/// 0 / invalid / absent means "all" (2),
+/// preserving the stock behaviour when the option is not configured.
+fn configured_lan_ports() -> usize {
+    // Must match the kmod's FMCS_ACTIVE_FTTR_PORTS: only that many fttrX
+    // netdevs exist in the kernel (2 in this build); bridging more is a no-op
+    // on nonexistent interfaces and would only create confusing status rows.
+    const DEFAULT: usize = 2;
+    let Ok(view) = crate::config::load() else {
+        return DEFAULT;
+    };
+    let raw = view.option("h3c", "lan_ports").unwrap_or_default();
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (1..=2).contains(&n) => n,
+        _ => DEFAULT,
+    }
+}
+
 fn setup_bridge() -> io::Result<()> {
-    crate::platform::openwrt::network::setup_bridge(&super::RESOURCES, "br-lan")
+    let ports = configured_lan_ports();
+    crate::platform::openwrt::network::setup_bridge_limited(&super::RESOURCES, "br-lan", ports)
 }
 
 fn start_ipc_server(
@@ -433,17 +453,21 @@ fn restore_optical_state(
     prepare: impl FnOnce() -> io::Result<()>,
     mut set_tx: impl FnMut(bool) -> io::Result<()>,
 ) -> io::Result<OpticalState> {
-    set_tx(false)?;
+    // Best-effort quiesce: a missing/inaccessible optical device must not
+    // abort initialization (this was a source of "No such device" failures).
+    if let Err(error) = set_tx(false) {
+        eprintln!("[-] Optical TX pre-quiesce failed (continuing): {error}");
+    }
     let enabled = enabled?;
     prepare()?;
     if enabled && !stopping.load(Ordering::Acquire) {
         if let Err(error) = set_tx(true) {
-            return match set_tx(false) {
-                Ok(()) => Err(error),
-                Err(reset) => Err(io::Error::other(format!(
-                    "{error}; recovery reset failed: {reset}"
-                ))),
-            };
+            // Do not abort the controller when optical TX cannot be enabled:
+            // keep the daemon and its ubus object alive in a degraded state so
+            // the dashboard still reports status instead of "Object not found".
+            eprintln!("[-] Optical TX enable failed (degraded mode): {error}");
+            let _ = set_tx(false);
+            return Ok(OpticalState::Unknown);
         }
         if stopping.load(Ordering::Acquire) {
             set_tx(false)?;
@@ -491,8 +515,10 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
         crate::optical::load_enabled(),
         stopping,
         || {
+            println!("[init] step 1/5: discovery timing");
             bosa::configure_discovery_timing()?;
             let (tx, fec) = super::pon_mac::desired();
+            println!("[init] step 2/5: downstream MAC (tx={tx}, fec={fec})");
             let applied = super::mac::set_downstream(tx, fec);
             super::pon_mac::record(
                 applied
@@ -501,10 +527,19 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
                     .map_err(|error| io::Error::other(error.to_string())),
             );
             applied?;
-            setup_bridge()?;
-            for &id in crate::platform::h3c_hm2004_du::RESOURCES.onu_ids {
-                clear_offline_hardware(id)?;
+            println!("[init] step 3/5: bridge setup");
+            // Bridging and per-ONU cleanup are best-effort: a failure there
+            // must not abort optical initialization or blank the controller UI.
+            if let Err(error) = setup_bridge() {
+                eprintln!("[init] bridge setup skipped with error: {error}");
             }
+            println!("[init] step 4/5: clear offline ONUs");
+            for &id in crate::platform::h3c_hm2004_du::RESOURCES.onu_ids {
+                if let Err(error) = clear_offline_hardware(id) {
+                    eprintln!("[init] clear ONU {id} skipped with error: {error}");
+            }
+            }
+            println!("[init] step 5/5: prepare complete");
             Ok(())
         },
         bosa::set_optical_tx_enable,
@@ -596,7 +631,25 @@ async fn run_async(platform: PlatformContext) {
             .stack_size(256 * 1024)
             .spawn(move || {
             println!("[+] Started background PLOAM discovery & reception loop.");
-            let initial = initialize_hardware(&stopping);
+            // Retry hardware initialization in-process a few times before
+            // giving up. The ubus 'fttr' object lives on a separate thread,
+            // so staying alive keeps get_status available to the UI instead
+            // of producing "Object not found" during a transient init failure.
+            const HW_INIT_ATTEMPTS: usize = 3;
+            let mut initial = initialize_hardware(&stopping);
+            let mut attempt = 1usize;
+            while initial.is_err()
+                && attempt < HW_INIT_ATTEMPTS
+                && !stopping.load(Ordering::Acquire)
+            {
+                if let Err(error) = &initial {
+                    eprintln!("[-] Hardware init attempt {attempt} failed: {error}; retrying in 2s");
+                }
+                let _ = bosa::set_optical_tx_enable(false);
+                thread::sleep(Duration::from_secs(2));
+                initial = initialize_hardware(&stopping);
+                attempt += 1;
+            }
             let (ready, state) = match initial {
                 Ok(state) => (true, state),
                 Err(error) if stopping.load(Ordering::Acquire) => {
@@ -605,13 +658,12 @@ async fn run_async(platform: PlatformContext) {
                     (false, OpticalState::Unknown)
                 }
                 Err(error) => {
-                    eprintln!("[-] Hardware initialization failed; requesting supervised restart: {error}");
-                    if let Err(reset) = bosa::set_optical_tx_enable(false) {
-                        eprintln!("[-] Recovery reset failed: {reset}");
-                    }
-                    // Spinning forever as a non-functional daemon has no
-                    // in-process recovery; let procd create a fresh process.
-                    std::process::exit(1);
+                    // Still failed after in-process retries. Do NOT exit the
+                    // process: keep the ubus object registered so the UI can
+                    // read a degraded status instead of "Object not found".
+                    eprintln!("[-] Hardware initialization failed after {attempt} attempts: {error}; staying alive in degraded mode");
+                    let _ = bosa::set_optical_tx_enable(false);
+                    (false, OpticalState::Unknown)
                 }
             };
             hardware_ready.store(ready, Ordering::Release);
